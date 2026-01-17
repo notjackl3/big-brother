@@ -86,6 +86,7 @@ export interface PageFeature {
   placeholder?: string;
   aria_label?: string;
   value_len?: number; // only for inputs; avoids sending sensitive text
+  already_clicked?: boolean; // Track if element was clicked before
 }
 
 export interface ContentResponse {

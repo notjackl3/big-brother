@@ -30,6 +30,7 @@ const SidePanel: React.FC = () => {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const manualAdvanceRef = useRef<boolean>(false);
   const manualAdvanceNoteRef = useRef<string>('');
+  const stopExecutionRef = useRef<boolean>(false);
   const [speechOutputEnabled, setSpeechOutputEnabled] = useState(false);
   const [showMicInstructions, setShowMicInstructions] = useState(false);
   const [isListening, setIsListening] = useState(false);
@@ -555,6 +556,12 @@ const SidePanel: React.FC = () => {
     let previousSuccess = false;
     let previousError: string | undefined = undefined;
 
+    // Reset stop flag at the start of execution
+    stopExecutionRef.current = false;
+
+    // Track recent actions to detect loops
+    const recentActions: Array<{ action: string; targetText: string; url: string }> = [];
+
     try {
       const waitForManualPageChange = async (opts: {
         prevUrl: string;
@@ -586,6 +593,12 @@ const SidePanel: React.FC = () => {
 
       // Drive execution off the backend `/next` so step order stays in sync.
       for (let guard = 0; guard < 200; guard++) {
+        // Check if user wants to stop execution
+        if (stopExecutionRef.current) {
+          addAgentMessage('🛑 Execution stopped by user.');
+          break;
+        }
+
         // Get current page features (fresh DOM)
         const featuresResponse: ContentResponse = await getFeaturesSafe();
         if (!featuresResponse.features) {
@@ -767,87 +780,78 @@ const SidePanel: React.FC = () => {
         // Wait a moment for user to see the highlight
         await delay(1200);
 
+        // Track this action (no warning needed - AI already sees already_clicked flag)
+        recentActions.push({
+          action,
+          targetText: nextAction.target_feature?.text || '',
+          url: prevUrl,
+        });
+        
+        // Keep only last 10 actions in memory
+        if (recentActions.length > 10) {
+          recentActions.shift();
+        }
+
         // Guidance-only: user performs the action. We just wait for the event.
         if (action === 'CLICK') {
-          addAgentMessage('Now please click the highlighted element.');
-          let detected = false;
-          let manualUsedThisStep = false;
-          for (let i = 0; i < 12; i++) {
-            const manual = consumeManualAdvance();
-            if (manual.advanced) {
-              detected = true;
-              manualUsedThisStep = true;
-              break;
-            }
-            const waited = await sendMessageToContent({
-              type: 'WAIT_FOR_EVENT',
-              payload: {
-                event: 'click',
-                targetIndex: nextAction.target_feature_index,
-                selector: nextAction.target_feature?.selector,
-                timeoutMs: 2500,
-              },
-              target: 'content',
-            });
-            if (waited.success) {
-              detected = true;
-              break;
-            }
-          }
-          if (!detected) {
-            addAgentMessage(`⚠️ I didn't detect a click yet. Try clicking again, or press **Next step** if you already did it.`);
+          // Automatically execute the CLICK action
+          addAgentMessage('🖱️ Clicking the element...');
+          
+          const executeResult = await sendMessageToContent({
+            type: 'EXECUTE_ACTION',
+            payload: {
+              action: 'CLICK',
+              targetIndex: nextAction.target_feature_index ?? null,
+            },
+            target: 'content',
+          });
+
+          if (!executeResult.success) {
+            addAgentMessage(`❌ Failed to click: ${executeResult.error || 'Unknown error'}`);
             previousSuccess = false;
-            previousError = 'No click detected';
+            previousError = executeResult.error || 'Click action failed';
             await delay(3000);
             continue;
           }
+
+          addAgentMessage(`✅ Successfully clicked the element.`);
           previousSuccess = true;
           previousError = undefined;
 
-          // If user manually advanced, don't hang waiting for a page change forever.
+          // Wait for page update if expected
           if (expectChange) {
             await waitForPageUpdate({
               prevUrl,
               prevSig,
               expectUrlChange: true,
-              timeoutMs: manualUsedThisStep ? 5000 : 20000,
+              timeoutMs: 20000,
             });
           }
         } else if (action === 'TYPE') {
-          addAgentMessage(
-            `Now please type this into the highlighted field:\n${textInput || '<TEXT>'}`
-          );
-          let detected = false;
-          let manualUsedThisStep = false;
-          for (let i = 0; i < 18; i++) {
-            const manual = consumeManualAdvance();
-            if (manual.advanced) {
-              detected = true;
-              manualUsedThisStep = true;
-              break;
-            }
-            const waited = await sendMessageToContent({
-              type: 'WAIT_FOR_EVENT',
-              payload: {
-                event: 'input',
-                targetIndex: nextAction.target_feature_index,
-                selector: nextAction.target_feature?.selector,
-                timeoutMs: 2500,
-              },
-              target: 'content',
-            });
-            if (waited.success) {
-              detected = true;
-              break;
-            }
-          }
-          if (!detected) {
-            addAgentMessage(`⚠️ I didn't detect typing yet. Type again, or press **Next step** if you already did it.`);
+          // Automatically execute the TYPE action
+          addAgentMessage(`⌨️ Typing "${textInput || ''}" into the field...`);
+          
+          const executeResult = await sendMessageToContent({
+            type: 'EXECUTE_ACTION',
+            payload: {
+              action: 'TYPE',
+              targetIndex: nextAction.target_feature_index ?? null,
+              textInput: textInput || '',
+            },
+            target: 'content',
+          });
+
+          if (!executeResult.success) {
+            addAgentMessage(`❌ Failed to type: ${executeResult.error || 'Unknown error'}`);
             previousSuccess = false;
-            previousError = 'No input detected';
+            previousError = executeResult.error || 'Type action failed';
             await delay(3000);
             continue;
           }
+
+          addAgentMessage(`✅ Successfully typed into the field.`);
+          previousSuccess = true;
+          previousError = undefined;
           previousSuccess = true;
           previousError = undefined;
 
@@ -856,7 +860,42 @@ const SidePanel: React.FC = () => {
               prevUrl,
               prevSig,
               expectUrlChange: true,
-              timeoutMs: manualUsedThisStep ? 5000 : 20000,
+              timeoutMs: 20000,
+            });
+          }
+        } else {
+          // For other actions (SCROLL, WAIT with element, etc.), use guidance mode
+          addAgentMessage(
+            `👆 **Please ${(action as string).toLowerCase()} this element:**\n` +
+            `${nextAction.target_feature?.text || instruction}`
+          );
+
+          const eventReceived = await sendMessageToContent({
+            type: 'WAIT_FOR_EVENT',
+            payload: {
+              action,
+              targetIndex: nextAction.target_feature_index ?? undefined,
+              selector: nextAction.target_feature?.selector,
+            },
+            target: 'content',
+          });
+
+          if (!eventReceived.success) {
+            addAgentMessage('⚠️ No interaction detected. Moving on...');
+            previousSuccess = false;
+            previousError = 'User interaction timeout';
+          } else {
+            addAgentMessage('✅ Action completed!');
+            previousSuccess = true;
+            previousError = undefined;
+          }
+
+          if (expectChange) {
+            await waitForPageUpdate({
+              prevUrl,
+              prevSig,
+              expectUrlChange: true,
+              timeoutMs: 20000,
             });
           }
         }
@@ -900,6 +939,13 @@ const SidePanel: React.FC = () => {
     setSession(null);
     chrome.storage.local.remove(['chatHistory', 'sessionState']);
     spokenMessageIdsRef.current.clear();
+  };
+
+  const stopExecution = () => {
+    stopExecutionRef.current = true;
+    addAgentMessage('🛑 **Execution stopped by user.**');
+    setSession((prev) => prev ? { ...prev, isExecuting: false } : null);
+    setStatus('idle');
   };
 
   const toggleSpeechInput = async () => {
@@ -1188,6 +1234,15 @@ const SidePanel: React.FC = () => {
       {/* Input Area */}
       <div className="border-t border-gray-200 bg-white px-4 py-4">
         <div className="flex gap-2">
+          {session?.isExecuting && (
+            <button
+              onClick={stopExecution}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors font-medium"
+              title="Stop the current execution"
+            >
+              🛑 Stop
+            </button>
+          )}
           <input
             type="text"
             value={inputValue}

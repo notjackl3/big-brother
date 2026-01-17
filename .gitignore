@@ -25,3 +25,14 @@ yarn-error.log*
 .env
 .env.local
 .env.*.local
+
+# python
+__pycache__/
+*.py[cod]
+*$py.
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env/

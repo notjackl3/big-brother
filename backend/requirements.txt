@@ -8,6 +8,7 @@ python-dotenv==1.0.0
 openai
 voyageai
 python-multipart==0.0.6
+backboard-sdk  # Backboard.io unified AI API
 
 # Testing
 pytest==7.4.3

@@ -31,12 +31,13 @@ async def connect_to_mongo() -> None:
     mongodb.client = _AsyncIOMotorClient(settings.mongodb_uri)
     mongodb.db = mongodb.client[settings.mongodb_db_name]
 
-    # Indexes
-    await mongodb.db.sessions.create_index("session_id", unique=True)
-    await mongodb.db.sessions.create_index("created_at")
-    await mongodb.db.execution_log.create_index([("session_id", ASCENDING), ("step_number", ASCENDING)])
+    # Indexes - commented out due to SSL handshake issues with MongoDB Atlas
+    # MongoDB may have IP whitelist restrictions or require TLS 1.3
+    # await mongodb.db.sessions.create_index("session_id", unique=True)
+    # await mongodb.db.sessions.create_index("created_at")
+    # await mongodb.db.execution_log.create_index([("session_id", ASCENDING), ("step_number", ASCENDING)])
 
-    logger.info("Connected to MongoDB and ensured indexes")
+    logger.info("Connected to MongoDB (indexes skipped due to SSL issues)")
 
 
 async def close_mongo_connection() -> None:

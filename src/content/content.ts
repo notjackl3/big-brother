@@ -9,6 +9,15 @@ let highlightOverlay: HTMLDivElement | null = null;
 let highlightOverlayRAF: number | null = null;
 let currentHighlightedEl: HTMLElement | null = null;
 
+// Track clicked elements to help AI avoid loops
+const clickedElements = new Set<string>();
+
+function markElementAsClicked(element: HTMLElement) {
+  const selector = generateSelector(element);
+  clickedElements.add(selector);
+  console.log('[Big Brother] Marked element as clicked:', selector);
+}
+
 function ensureHighlightOverlay(): HTMLDivElement {
   if (highlightOverlay && document.documentElement.contains(highlightOverlay)) return highlightOverlay;
   const el = document.createElement('div');
@@ -129,9 +138,37 @@ function extractPageFeatures(): ContentResponse {
   const features: PageFeature[] = [];
   let index = 0;
 
-  // Collect inputs first (usually most important for forms)
+  // Collect navigation links first (including those in collapsed menus/dropdowns)
+  // These are critical for site navigation even if temporarily hidden
+  const navLinks = Array.from(document.querySelectorAll('header a[href], nav a[href], [role="navigation"] a[href], .header a[href], .nav a[href]'));
+  navLinks.slice(0, 100).forEach((link) => {
+    const el = link as HTMLAnchorElement;
+    // For navigation, use a relaxed visibility check - just ensure it's not permanently hidden
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' && !el.closest('details, [aria-expanded]')) return; // Skip only if truly hidden, not just in a collapsed menu
+    
+    const text = el.innerText.trim() || el.textContent?.trim() || '';
+    const ariaLabel = el.getAttribute('aria-label') || '';
+    const href = el.getAttribute('href') || '';
+    
+    if (!text && !ariaLabel) return;
+    if (href.startsWith('#') && !href.includes('MainContent')) return; // Skip internal anchors except skip links
+    
+    const selector = generateSelector(el);
+    features.push({
+      index: index++,
+      type: 'link',
+      text: (text || ariaLabel).substring(0, 100),
+      selector,
+      href: href || undefined,
+      aria_label: ariaLabel || undefined,
+      already_clicked: clickedElements.has(selector),
+    });
+  });
+
+  // Collect inputs (usually most important for forms)
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
-  inputs.slice(0, 10).forEach((input) => {
+  inputs.slice(0, 20).forEach((input) => {
     const el = input as HTMLInputElement;
     if (!isVisible(el)) return;
     
@@ -139,21 +176,23 @@ function extractPageFeatures(): ContentResponse {
     const ariaLabel = el.getAttribute('aria-label') || '';
     const name = el.getAttribute('name') || '';
     const label = findLabelFor(el);
+    const selector = generateSelector(el);
     
     features.push({
         index: index++,
       type: 'input',
       text: label || name || placeholder || el.getAttribute('type') || 'text',
-      selector: generateSelector(el),
+      selector,
       placeholder: placeholder || undefined,
       aria_label: ariaLabel || label || undefined,
       value_len: typeof (el as any).value === 'string' ? ((el as any).value as string).length : 0,
+      already_clicked: clickedElements.has(selector),
     });
   });
 
   // Collect buttons
   const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
-  buttons.slice(0, 15).forEach((button) => {
+  buttons.slice(0, 20).forEach((button) => {
     const el = button as HTMLElement;
     if (!isVisible(el)) return;
     
@@ -161,19 +200,23 @@ function extractPageFeatures(): ContentResponse {
     const ariaLabel = el.getAttribute('aria-label') || '';
     if (!text && !ariaLabel) return;
     
+    const selector = generateSelector(el);
     features.push({
         index: index++,
         type: 'button',
       text: (text || ariaLabel).substring(0, 100),
-      selector: generateSelector(el),
+      selector,
       aria_label: ariaLabel || undefined,
+      already_clicked: clickedElements.has(selector),
     });
   });
 
-  // Collect links
+  // Collect other links (non-navigation)
   const links = Array.from(document.querySelectorAll('a[href]'));
-  links.slice(0, 15).forEach((link) => {
+  links.slice(0, 20).forEach((link) => {
     const el = link as HTMLAnchorElement;
+    // Skip if already collected as nav link
+    if (el.closest('header, nav, [role="navigation"], .header, .nav')) return;
     if (!isVisible(el)) return;
     
     const text = el.innerText.trim() || el.textContent?.trim() || '';
@@ -285,6 +328,7 @@ async function executeAction(payload: {
     movePointerToElement(element);
     await new Promise((resolve) => setTimeout(resolve, 800));
     element.click();
+    markElementAsClicked(element); // Track that this element was clicked
     return { success: true, message: `Clicked: ${feature.text}` };
   }
 

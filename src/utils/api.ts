@@ -11,6 +11,7 @@ export interface PageFeature {
   placeholder?: string;
   aria_label?: string;
   value_len?: number;
+  already_clicked?: boolean;
 }
 
 export interface TargetHints {

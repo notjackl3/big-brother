@@ -9,6 +9,7 @@ from app.config import settings
 from app.database import close_mongo_connection, connect_to_mongo
 from app.routes import session
 from app.utils.rate_limiter import get_rate_limit_status
+from app.services.backboard_ai import backboard_ai
 
 
 def create_app(with_db: bool = True) -> FastAPI:
@@ -44,6 +45,17 @@ def create_app(with_db: bool = True) -> FastAPI:
     async def rate_limit_status():
         """Check current rate limit status for Gemini API calls."""
         return get_rate_limit_status()
+
+    @app.get("/api/backboard/stats")
+    async def backboard_stats():
+        """Get Backboard.io model usage statistics (demonstrates multi-model switching)"""
+        return backboard_ai.get_model_stats()
+
+    @app.post("/api/backboard/learn")
+    async def learn_pattern(user_id: str, interaction_data: dict):
+        """Learn from user interaction (adaptive memory feature)"""
+        result = await backboard_ai.learn_pattern(user_id, interaction_data)
+        return result
 
     return app
 

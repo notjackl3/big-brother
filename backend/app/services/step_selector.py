@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import List, Optional
 
 from app.config import settings
 from app.models import PageFeature, PlannedStep, TargetHints
 from app.utils.helpers import extract_json_object
+
+logger = logging.getLogger(__name__)
+
+# Flag to enable/disable Backboard.io (matches planner.py)
+USE_BACKBOARD = True
 
 
 def _call_openai_sync(prompt: str) -> str:
@@ -106,7 +112,41 @@ async def select_next_step(
         page_features=page_features,
         recent_steps=recent_steps,
     )
-    raw = _call_openai_sync(prompt)
+    
+    # Try Backboard.io first (uses Grok for quick decisions)
+    if USE_BACKBOARD and settings.backboard_api_key and settings.backboard_api_key != "your_backboard_api_key_here":
+        try:
+            from app.services.backboard_ai import backboard_ai, TaskType
+            logger.info("🚀 Using Backboard.io (Grok) for step selection")
+            
+            # Use match_element for quick decision-making
+            features_dict = [
+                {
+                    "index": f.index,
+                    "type": f.type,
+                    "text": f.text or "",
+                    "placeholder": getattr(f, "placeholder", "") or "",
+                    "aria_label": getattr(f, "aria_label", "") or "",
+                    "href": getattr(f, "href", "") or "",
+                }
+                for f in page_features
+            ]
+            
+            # Use Backboard with QUICK_DECISION task type (routes to Grok)
+            raw = await backboard_ai._call_with_memory(
+                user_id="step_selector",
+                prompt=prompt,
+                task_type=TaskType.QUICK_DECISION
+            )
+            logger.info("✅ Backboard.io step selection complete")
+        except Exception as backboard_error:
+            logger.warning(f"⚠️ Backboard.io failed for step selection: {backboard_error}")
+            logger.info("Falling back to OpenAI for step selection")
+            raw = _call_openai_sync(prompt)
+    else:
+        logger.info("Using OpenAI for step selection (Backboard not configured)")
+        raw = _call_openai_sync(prompt)
+    
     data = extract_json_object(raw)
 
     # Make it tolerant: fill defaults

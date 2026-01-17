@@ -28,6 +28,7 @@ if BaseSettings is not None:
         mongodb_db_name: str
         openai_api_key: str  # Changed from gemini_api_key
         voyage_api_key: str
+        backboard_api_key: str  # Backboard.io unified API
         environment: str = "development"
         log_level: str = "INFO"
         
@@ -47,6 +48,7 @@ else:
             self.mongodb_db_name = os.getenv("MONGODB_DB_NAME", "tutor_agent")
             self.openai_api_key = os.getenv("OPENAI_API_KEY", "")  # Changed from GEMINI_API_KEY
             self.voyage_api_key = os.getenv("VOYAGE_API_KEY", "")
+            self.backboard_api_key = os.getenv("BACKBOARD_API_KEY", "")  # Backboard.io unified API
             self.environment = os.getenv("ENVIRONMENT", "development")
             self.log_level = os.getenv("LOG_LEVEL", "INFO")
             

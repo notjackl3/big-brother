@@ -36,6 +36,40 @@ from app.services.step_selector import select_next_step
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# In-memory session cache for when MongoDB is unavailable
+_session_cache: Dict[str, Dict[str, Any]] = {}
+
+
+async def update_session(db, session_id: str, updates: Dict[str, Any]):
+    """
+    Update session in both MongoDB and cache
+    Continues if MongoDB fails
+    """
+    try:
+        await db.sessions.update_one(
+            {"session_id": session_id},
+            {"$set": updates}
+        )
+    except Exception as e:
+        logger.warning(f"MongoDB update failed for session {session_id}: {e}")
+    
+    # Always update cache
+    if session_id in _session_cache:
+        _session_cache[session_id].update(updates)
+
+
+async def safe_db_operation(operation_name: str, db_call):
+    """
+    Wrapper to make MongoDB operations optional
+    Logs failures but allows app to continue without database
+    """
+    try:
+        await db_call()
+        return True
+    except Exception as e:
+        logger.warning(f"MongoDB operation '{operation_name}' failed (continuing without persistence): {e}")
+        return False
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -260,11 +294,18 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
         "updated_at": now,
     }
 
+    # Try to persist session, but continue even if MongoDB fails
+    session_persisted = False
     try:
         await db.sessions.insert_one(session_doc)
+        session_persisted = True
+        logger.info(f"Session {session_id} persisted to MongoDB")
     except Exception as e:
-        logger.exception("Failed to create session")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"MongoDB error: {e}") from e
+        logger.warning(f"Failed to persist session to MongoDB (continuing without persistence): {e}")
+        # Continue without database - session will work in memory only
+    
+    # Always cache in memory as backup
+    _session_cache[session_id] = session_doc
 
     match = match_element_to_step(first_step, request.initial_page_features)
     match_method = "algorithm"
@@ -313,16 +354,26 @@ async def start_session(request: StartSessionRequest, db: AsyncIOMotorDatabase =
 @router.post("/next", response_model=NextActionResponse)
 async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Depends(get_db)):
     """
-    1. Get session from MongoDB
+    1. Get session from MongoDB or cache
     2. Advance step (if last sent step was executed successfully)
     3. Match current step to page_features
     4. If no match, try Gemini fallback
     5. Log execution
     6. Return instruction + target
     """
-    session_doc = await db.sessions.find_one({"session_id": request.session_id})
+    # Try MongoDB first, fallback to cache
+    session_doc = None
+    try:
+        session_doc = await db.sessions.find_one({"session_id": request.session_id})
+    except Exception as e:
+        logger.warning(f"MongoDB lookup failed, using cache: {e}")
+    
+    # Fallback to in-memory cache
     if not session_doc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        session_doc = _session_cache.get(request.session_id)
+        if not session_doc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+        logger.info(f"Using cached session {request.session_id}")
 
     total_steps = len(session_doc.get("planned_steps") or [])
     if total_steps == 0:
@@ -351,16 +402,11 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
     # Update seen markers (we still use previous values below for change detection).
     if request.url:
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {
-                "$set": {
-                    "last_seen_url": request.url,
-                    "last_seen_sig": _features_signature(request.page_features),
-                    "updated_at": now,
-                }
-            },
-        )
+        await update_session(db, request.session_id, {
+            "last_seen_url": request.url,
+            "last_seen_sig": _features_signature(request.page_features),
+            "updated_at": now,
+        })
 
     # NOTE: legacy full-plan "replan on domain change" removed.
 
@@ -391,10 +437,11 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
             target_hints=TargetHints(),
             expected_page_change=True,
         )
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {"$set": {"current_step_number": current_step_number, "last_sent_step_number": current_step_number, "updated_at": now}},
-        )
+        await update_session(db, request.session_id, {
+            "current_step_number": current_step_number,
+            "last_sent_step_number": current_step_number,
+            "updated_at": now
+        })
         return NextActionResponse(
             step_number=step.step_number,
             total_steps=step.step_number,
@@ -410,10 +457,11 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
     # In single_step mode, we never "run out" of steps; we keep generating.
     if mode != "single_step" and current_step_number > total_steps:
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {"$set": {"status": "completed", "updated_at": now, "current_step_number": total_steps}},
-        )
+        await update_session(db, request.session_id, {
+            "status": "completed",
+            "updated_at": now,
+            "current_step_number": total_steps
+        })
         return NextActionResponse(
             step_number=total_steps,
             total_steps=total_steps,
@@ -444,17 +492,12 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
 
         steps_list = session_doc.get("planned_steps") or []
         steps_list.append(new_step.model_dump())
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {
-                "$set": {
-                    "planned_steps": steps_list,
-                    "current_step_number": current_step_number,
-                    "last_sent_step_number": current_step_number,
-                    "updated_at": now,
-                }
-            },
-        )
+        await update_session(db, request.session_id, {
+            "planned_steps": steps_list,
+            "current_step_number": current_step_number,
+            "last_sent_step_number": current_step_number,
+            "updated_at": now,
+        })
         step = new_step
         total_steps = len(steps_list)
     elif not step:
@@ -465,17 +508,12 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
         match = {"matched": True, "feature_index": None, "confidence": 1.0, "feature": None}
         match_method = "algorithm"
     elif step.action == "DONE":
-        await db.sessions.update_one(
-            {"session_id": request.session_id},
-            {
-                "$set": {
-                    "status": "completed",
-                    "updated_at": now,
-                    "current_step_number": current_step_number,
-                    "last_sent_step_number": current_step_number,
-                }
-            },
-        )
+        await update_session(db, request.session_id, {
+            "status": "completed",
+            "updated_at": now,
+            "current_step_number": current_step_number,
+            "last_sent_step_number": current_step_number,
+        })
         return NextActionResponse(
             step_number=current_step_number,
             total_steps=total_steps,
@@ -520,20 +558,15 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
                     ) from e
 
                 if new_steps:
-                    await db.sessions.update_one(
-                        {"session_id": request.session_id},
-                        {
-                            "$set": {
-                                "planned_steps": [s.model_dump() for s in new_steps],
-                                "current_step_number": new_steps[0].step_number,
-                                "last_sent_step_number": new_steps[0].step_number,
-                                "updated_at": now,
-                                "url": request.url,
-                                "domain": _domain_from_url(request.url),
-                                "planned_domain": _domain_from_url(request.url),
-                            }
-                        },
-                    )
+                    await update_session(db, request.session_id, {
+                        "planned_steps": [s.model_dump() for s in new_steps],
+                        "current_step_number": new_steps[0].step_number,
+                        "last_sent_step_number": new_steps[0].step_number,
+                        "updated_at": now,
+                        "url": request.url,
+                        "domain": _domain_from_url(request.url),
+                        "planned_domain": _domain_from_url(request.url),
+                    })
 
                     step = new_steps[0]
                     if step.action in {"SCROLL", "WAIT"}:
@@ -588,16 +621,11 @@ async def next_action(request: NextActionRequest, db: AsyncIOMotorDatabase = Dep
     except Exception:
         logger.exception("Failed to insert execution log (next)")
 
-    await db.sessions.update_one(
-        {"session_id": request.session_id},
-        {
-            "$set": {
-                "current_step_number": current_step_number,
-                "last_sent_step_number": step.step_number,
-                "updated_at": now,
-            }
-        },
-    )
+    await update_session(db, request.session_id, {
+        "current_step_number": current_step_number,
+        "last_sent_step_number": step.step_number,
+        "updated_at": now,
+    })
 
     return NextActionResponse(
         step_number=step.step_number,
@@ -688,7 +716,16 @@ async def handle_correction(request: CorrectionRequest, db: AsyncIOMotorDatabase
 
 @router.get("/{session_id}/status", response_model=SessionStatusResponse)
 async def session_status(session_id: str, db: AsyncIOMotorDatabase = Depends(get_db)):
-    session_doc = await db.sessions.find_one({"session_id": session_id})
+    # Try MongoDB first, fallback to cache
+    session_doc = None
+    try:
+        session_doc = await db.sessions.find_one({"session_id": session_id})
+    except Exception as e:
+        logger.warning(f"MongoDB lookup failed: {e}")
+    
+    if not session_doc:
+        session_doc = _session_cache.get(session_id)
+    
     if not session_doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
