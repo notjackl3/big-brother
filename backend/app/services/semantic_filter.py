@@ -80,7 +80,7 @@ async def semantic_filter_features(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """
     Filter and rank features by semantic similarity to user goal
-    Returns top 20 from each category (inputs, buttons, links) - 60 total
+    Returns top 25 from each category (inputs, buttons, links) - 75 total
     
     Args:
         user_goal: What the user wants to accomplish
@@ -90,19 +90,28 @@ async def semantic_filter_features(
         Dict with filtered lists: {"inputs": [...], "buttons": [...], "links": [...]}
     """
     if not USE_SEMANTIC_FILTER or not features:
-        # Group by type and return top 20 each
+        # Group by type and return top 25 each
         by_type = {"input": [], "button": [], "link": []}
         for f in features:
             ftype = f.get("type", "link")
             by_type[ftype].append(f)
         return {
-            "inputs": by_type["input"][:20],
-            "buttons": by_type["button"][:20],
-            "links": by_type["link"][:20]
+            "inputs": by_type["input"][:25],
+            "buttons": by_type["button"][:25],
+            "links": by_type["link"][:25]
         }
     
     try:
         logger.info(f"🔍 Semantic filtering {len(features)} features for goal: {user_goal[:50]}...")
+        
+        # Analyze goal to detect if it's product-focused
+        goal_lower = user_goal.lower()
+        is_product_focused = any(kw in goal_lower for kw in [
+            'buy', 'purchase', 'find', 'looking for', 'search for', 'add to cart',
+            'trouser', 'pant', 'skirt', 'dress', 'shirt', 'shoe', 'jacket', 'item',
+            'product', 'price', '$', 'shop', 'clothing', 'apparel'
+        ])
+        logger.info(f"🎯 Goal analysis: product_focused={is_product_focused}")
         
         # Build text representations
         feature_texts = []
@@ -132,6 +141,8 @@ async def semantic_filter_features(
         action_keywords = ['add to cart', 'add to bag', 'buy now', 'purchase', 'checkout', 
                           'add', 'submit', 'continue', 'proceed', 'confirm', 'place order']
         menu_keywords = ['menu', 'navigation', 'nav', 'hamburger', 'close', 'open menu']
+        nav_keywords = ['home', 'about', 'contact', 'account', 'login', 'sign in', 'cart', 
+                       'wishlist', 'search', 'help', 'faq', 'support', 'shipping', 'returns']
         product_keywords = ['product', 'item', '$', 'price', 'shop', 'quick view', 'quick add',
                            'trouser', 'pant', 'skirt', 'dress', 'shirt', 'shoe', 'jacket']
         
@@ -140,34 +151,45 @@ async def semantic_filter_features(
                 np.linalg.norm(goal_embedding) * np.linalg.norm(feature_emb) + 1e-8
             )
             
-            # Apply smart weighting
+            # Apply smart weighting based on context
             feature = features[i]
             text_lower = (feature.get('text', '') + ' ' + feature.get('aria_label', '') + ' ' + feature.get('href', '')).lower()
             
             # Strong penalty for pagination to avoid loops
             is_pagination = any(kw in text_lower for kw in pagination_keywords)
             if is_pagination and feature.get('type') == 'link':
-                similarity *= 0.2  # Very strong penalty
+                similarity *= 0.1  # Very strong penalty
             
-            # Boost category/navigation links (they lead to product pages)
-            is_category = any(kw in text_lower for kw in category_keywords)
-            if is_category and feature.get('type') == 'link' and not is_pagination:
-                similarity *= 1.5  # Boost navigation links
+            # Context-aware navigation/menu filtering
+            is_nav = any(kw in text_lower for kw in nav_keywords)
+            is_menu = any(kw in text_lower for kw in menu_keywords)
             
-            # STRONG boost for product links (actual items for sale)
+            # If this is a product-focused goal, heavily penalize nav/menu items
+            if is_product_focused:
+                if is_nav and feature.get('type') == 'link':
+                    similarity *= 0.15  # Strong penalty for nav links
+                if is_menu and feature.get('type') in ['button', 'link']:
+                    similarity *= 0.05  # Very strong penalty for menu
+                    
+                # Also penalize very short link text (likely nav)
+                link_text = feature.get('text', '').strip()
+                if feature.get('type') == 'link' and len(link_text) < 4 and not any(kw in text_lower for kw in product_keywords):
+                    similarity *= 0.2  # Short nav text penalty
+            else:
+                # Not product-focused, so category navigation is useful
+                is_category = any(kw in text_lower for kw in category_keywords)
+                if is_category and feature.get('type') == 'link' and not is_pagination:
+                    similarity *= 1.5  # Boost category navigation
+            
+            # VERY STRONG boost for product links (actual items for sale)
             is_product = any(kw in text_lower for kw in product_keywords)
             if is_product and feature.get('type') == 'link' and not is_pagination:
-                similarity *= 2.5  # Very strong boost for product links
+                similarity *= 3.5  # Massive boost for product links
             
             # STRONG boost for action buttons (add to cart, buy now, etc.)
             is_action = any(kw in text_lower for kw in action_keywords)
             if is_action and feature.get('type') in ['button', 'link']:
-                similarity *= 2.0  # Very strong boost for action buttons
-            
-            # Penalty for menu/nav buttons to avoid clicking them
-            is_menu = any(kw in text_lower for kw in menu_keywords)
-            if is_menu and feature.get('type') == 'button':
-                similarity *= 0.1  # Very strong penalty for menu buttons
+                similarity *= 2.5  # Very strong boost for action buttons
             
             similarities.append((i, float(similarity), features[i]))
         
@@ -178,15 +200,15 @@ async def semantic_filter_features(
             feature['_similarity_score'] = score
             by_type[ftype].append((score, feature))
         
-        # Sort each category and take top 20
+        # Sort each category and take top 25
         result = {}
         for ftype in ["input", "button", "link"]:
             sorted_items = sorted(by_type[ftype], key=lambda x: x[0], reverse=True)
-            # Filter by threshold and take top 20
-            filtered = [item[1] for item in sorted_items if item[0] >= SIMILARITY_THRESHOLD][:20]
+            # Filter by threshold and take top 25
+            filtered = [item[1] for item in sorted_items if item[0] >= SIMILARITY_THRESHOLD][:25]
             # If too few, add lower-scoring ones
-            if len(filtered) < 10 and len(sorted_items) > len(filtered):
-                remaining = [item[1] for item in sorted_items[len(filtered):]][:10 - len(filtered)]
+            if len(filtered) < 12 and len(sorted_items) > len(filtered):
+                remaining = [item[1] for item in sorted_items[len(filtered):]][:12 - len(filtered)]
                 filtered.extend(remaining)
             result[ftype + "s"] = filtered  # "inputs", "buttons", "links"
         

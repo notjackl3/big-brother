@@ -150,10 +150,10 @@ function extractPageFeatures(): ContentResponse {
   console.log(`🛍️ Found ${productLinks.length} product link candidates`);
   
   const otherLinks = Array.from(document.querySelectorAll(
-    'a[href]'
+    'a[href]:not(header a):not(footer a):not(nav a):not([role="navigation"] a)'
   ));
   
-  console.log(`🔗 Found ${otherLinks.length} total link candidates`);
+  console.log(`🔗 Found ${otherLinks.length} total link candidates (excluding header/footer/nav)`);
   
   // Combine: products first, then others
   const allLinks = [...productLinks, ...otherLinks];
@@ -168,6 +168,10 @@ function extractPageFeatures(): ContentResponse {
     
     const el = link as HTMLAnchorElement;
     const href = el.getAttribute('href') || '';
+    
+    // Skip invalid or nav links
+    if (!href || href.startsWith('javascript:') || href === '#') continue;
+    if (el.closest('header, footer, nav, [role="navigation"]')) continue;
     
     // Skip duplicates
     if (seenUrls.has(href)) continue;
@@ -209,7 +213,7 @@ function extractPageFeatures(): ContentResponse {
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
   const inputFeatures: PageFeature[] = [];
   for (const input of inputs) {
-    if (inputFeatures.length >= 60) break; // Stop at 60 inputs
+    if (inputFeatures.length >= 75) break; // Stop at 75 inputs
     
     const el = input as HTMLInputElement;
     if (!isVisible(el)) continue;
@@ -254,7 +258,7 @@ function extractPageFeatures(): ContentResponse {
   const seenButtonSelectors = new Set<string>();
   
   for (const button of allButtons) {
-    if (buttonFeatures.length >= 60) break; // Stop at 60 buttons
+    if (buttonFeatures.length >= 75) break; // Stop at 75 buttons
     
     const el = button as HTMLElement;
     

@@ -182,7 +182,7 @@ async def generate_workflow_plan(
             for f in initial_features[:110]  # Limit to 110 for embedding efficiency
         ]
         
-        # Semantic filtering - returns top 20 from each category (inputs, buttons, links)
+        # Semantic filtering - returns top 25 from each category (inputs, buttons, links)
         filtered_by_type = await semantic_filter_features(user_goal, features_dict)
         # Flatten back to single list
         filtered_features = (
@@ -201,7 +201,7 @@ async def generate_workflow_plan(
         logger.info("🔍 ELEMENTS BEING SENT TO AI:")
         logger.info(f"Goal: {user_goal}")
         logger.info(f"URL: {url}")
-        logger.info(f"📦 Sending: {input_count} inputs, {button_count} buttons, {link_count} links (max 60 total)")
+        logger.info(f"📦 Sending: {input_count} inputs, {button_count} buttons, {link_count} links (max 75 total)")
         logger.info("-" * 80)
         
         # Show inputs first
