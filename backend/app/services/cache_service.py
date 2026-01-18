@@ -226,7 +226,12 @@ async def lookup_exact_match(
             }
         
         # Strategy 2: Exact match on original_user_goal (raw prompt)
+        # Normalize both the query and stored values for case-insensitive matching
         if user_goal:
+            # Normalize: lowercase and collapse multiple spaces
+            normalized_goal = " ".join(user_goal.lower().split())
+            
+            # Try exact match first (fastest)
             exact_match = await collection.find_one({
                 "original_user_goal": user_goal,
                 "avg_completion_rate": {"$gte": MIN_COMPLETION_RATE},
@@ -241,6 +246,26 @@ async def lookup_exact_match(
                     "match_method": "exact_raw",
                     "cached_plan": exact_match,
                 }
+            
+            # If no exact match, try normalized match (case-insensitive, whitespace-agnostic)
+            # Fetch candidates and check normalized versions
+            candidates = await collection.find({
+                "avg_completion_rate": {"$gte": MIN_COMPLETION_RATE},
+            }).limit(100).to_list(length=100)
+            
+            for candidate in candidates:
+                candidate_goal = candidate.get("original_user_goal", "")
+                normalized_candidate = " ".join(candidate_goal.lower().split())
+                
+                if normalized_candidate == normalized_goal:
+                    logger.info(f"Cache NORMALIZED HIT on raw prompt (instant): {candidate.get('cache_id')}")
+                    return {
+                        "hit": True,
+                        "cache_id": candidate.get("cache_id"),
+                        "confidence": 1.0,
+                        "match_method": "exact_normalized",
+                        "cached_plan": candidate,
+                    }
         
         return result
         
