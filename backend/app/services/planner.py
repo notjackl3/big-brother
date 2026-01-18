@@ -24,14 +24,14 @@ class PlannerError(RuntimeError):
 def build_planner_prompt(user_goal: str, initial_features: list, url: str, page_title: str = "") -> str:
     features = [
         {
-            "index": f.index,
-            "type": f.type,
-            "text": f.text or "",
-            "placeholder": getattr(f, "placeholder", "") or "",
-            "aria_label": getattr(f, "aria_label", "") or "",
-            "href": getattr(f, "href", "") or "",
-            "selector": f.selector or "",
-            "already_clicked": getattr(f, "already_clicked", False),
+            "index": f.get("index") if isinstance(f, dict) else f.index,
+            "type": f.get("type") if isinstance(f, dict) else f.type,
+            "text": f.get("text", "") if isinstance(f, dict) else (f.text or ""),
+            "placeholder": f.get("placeholder", "") if isinstance(f, dict) else (getattr(f, "placeholder", "") or ""),
+            "aria_label": f.get("aria_label", "") if isinstance(f, dict) else (getattr(f, "aria_label", "") or ""),
+            "href": f.get("href", "") if isinstance(f, dict) else (getattr(f, "href", "") or ""),
+            "selector": f.get("selector", "") if isinstance(f, dict) else (f.selector or ""),
+            "already_clicked": f.get("already_clicked", False) if isinstance(f, dict) else getattr(f, "already_clicked", False),
         }
         for f in initial_features[:20]  # Reduced for speed
     ]
@@ -71,6 +71,13 @@ CRITICAL RULES:
 - AVOID LOOPS: If a single action would complete the goal (e.g., clicking one navigation link), generate ONLY that action followed by DONE
   - Never generate multiple identical or redundant steps
   - After clicking a navigation link, the next plan should recognize the URL changed and either continue or finish
+  - PAGINATION WARNING: NEVER repeatedly click "next", "previous", or page number links without a specific reason
+  - If you need to find items, use category navigation (e.g., Women > Skirts) or search instead of pagination
+  - Clicking "next" should only be a last resort if the specific item/category is not found on the current page
+- NAVIGATION STRATEGY: When looking for specific items (e.g., "buy skirts", "find jewelry"):
+  - PREFER: Category navigation links (Women > Skirts, Shop > Accessories)
+  - SECOND CHOICE: Search functionality (type query, then click search)
+  - LAST RESORT: Pagination (clicking "next" to browse pages)
 - SEARCH HANDLING: When the goal involves searching (e.g., "buy hats", "find jewelry"):
   - DO NOT repeatedly click search links/buttons without typing first
   - Look for INPUT elements with type="input" and placeholder/aria_label containing "search"
@@ -153,8 +160,95 @@ async def generate_workflow_plan(
     Use Backboard.io (or OpenAI fallback) to generate complete step-by-step workflow.
     Implements multi-model switching and adaptive memory for Backboard.io challenge.
     Includes rate limiting and retry logic.
+    Now with semantic filtering using Voyage AI!
     """
-    prompt = build_planner_prompt(user_goal=user_goal, initial_features=initial_features, url=url, page_title=page_title)
+    # Apply semantic filtering to focus on relevant elements
+    from app.services.semantic_filter import semantic_filter_features
+    
+    try:
+        # Convert PageFeatures to dicts for semantic filtering
+        features_dict = [
+            {
+                "selector": getattr(f, "selector", ""),
+                "index": f.index,
+                "type": f.type,
+                "text": f.text or "",
+                "placeholder": getattr(f, "placeholder", "") or "",
+                "aria_label": getattr(f, "aria_label", "") or "",
+                "href": getattr(f, "href", "") or "",
+                "value": getattr(f, "value", "") or "",
+                "already_clicked": getattr(f, "already_clicked", False),
+            }
+            for f in initial_features[:110]  # Limit to 110 for embedding efficiency
+        ]
+        
+        # Semantic filtering - returns top 20 from each category (inputs, buttons, links)
+        filtered_by_type = await semantic_filter_features(user_goal, features_dict)
+        # Flatten back to single list
+        filtered_features = (
+            filtered_by_type.get("inputs", []) +
+            filtered_by_type.get("buttons", []) +
+            filtered_by_type.get("links", [])
+        )
+        # Count by category
+        input_count = len(filtered_by_type.get("inputs", []))
+        button_count = len(filtered_by_type.get("buttons", []))
+        link_count = len(filtered_by_type.get("links", []))
+        logger.info(f"📊 Semantic filter: {len(features_dict)} → {len(filtered_features)} features ({input_count}i + {button_count}b + {link_count}l)")
+        
+        # Log what elements are being sent to the AI
+        logger.info("=" * 80)
+        logger.info("🔍 ELEMENTS BEING SENT TO AI:")
+        logger.info(f"Goal: {user_goal}")
+        logger.info(f"URL: {url}")
+        logger.info(f"📦 Sending: {input_count} inputs, {button_count} buttons, {link_count} links (max 60 total)")
+        logger.info("-" * 80)
+        
+        # Show inputs first
+        logger.info("📝 INPUTS:")
+        for idx, feat in enumerate(filtered_by_type.get("inputs", [])[:15], 1):
+            score = feat.get('_similarity_score', 0.0)
+            text = feat.get('text', '')[:40] or feat.get('placeholder', '')[:40]
+            clicked = "✓" if feat.get('already_clicked') else " "
+            logger.info(f"  {idx:2d}. [{clicked}] {text:40s} (score: {score:.3f})")
+        
+        # Show buttons
+        logger.info("🔘 BUTTONS:")
+        for idx, feat in enumerate(filtered_by_type.get("buttons", [])[:15], 1):
+            score = feat.get('_similarity_score', 0.0)
+            text = feat.get('text', '')[:40]
+            clicked = "✓" if feat.get('already_clicked') else " "
+            logger.info(f"  {idx:2d}. [{clicked}] {text:40s} (score: {score:.3f})")
+        
+        # Show links
+        logger.info("🔗 LINKS:")
+        for idx, feat in enumerate(filtered_by_type.get("links", [])[:20], 1):
+            score = feat.get('_similarity_score', 0.0)
+            text = feat.get('text', '')[:40] or feat.get('href', '')[:40]
+            clicked = "✓" if feat.get('already_clicked') else " "
+            logger.info(f"  {idx:2d}. [{clicked}] {text:40s} (score: {score:.3f})")
+        
+        logger.info("=" * 80)
+    except Exception as e:
+        logger.warning(f"Semantic filtering failed, using smart fallback: {e}")
+        # Fallback: top 30 from each category without semantic ranking
+        by_type = {"input": [], "button": [], "link": []}
+        for f in initial_features[:110]:
+            ftype = f.type
+            by_type[ftype].append({
+                "selector": getattr(f, "selector", ""),
+                "index": f.index,
+                "type": f.type,
+                "text": f.text or "",
+                "placeholder": getattr(f, "placeholder", "") or "",
+                "aria_label": getattr(f, "aria_label", "") or "",
+                "href": getattr(f, "href", "") or "",
+                "value": getattr(f, "value", "") or "",
+                "already_clicked": getattr(f, "already_clicked", False),
+            })
+        filtered_features = by_type["input"][:30] + by_type["button"][:30] + by_type["link"][:30]
+    
+    prompt = build_planner_prompt(user_goal=user_goal, initial_features=filtered_features, url=url, page_title=page_title)
 
     # Log what's being sent
     logger.info("=" * 60)
@@ -176,21 +270,10 @@ async def generate_workflow_plan(
                 from app.services.backboard_ai import backboard_ai
                 
                 logger.info("✅ Using Backboard.io multi-model AI")
-                features_dict = [
-                    {
-                        "index": f.index,
-                        "type": f.type,
-                        "text": f.text or "",
-                        "placeholder": getattr(f, "placeholder", "") or "",
-                        "aria_label": getattr(f, "aria_label", "") or "",
-                        "href": getattr(f, "href", "") or "",
-                    }
-                    for f in initial_features
-                ]
                 
                 text = await backboard_ai.generate_plan(
                     user_goal=user_goal,
-                    page_features=features_dict,
+                    page_features=filtered_features,  # Already filtered semantically
                     url=url,
                     page_title=page_title,
                     user_id=user_id

@@ -138,50 +138,60 @@ function extractPageFeatures(): ContentResponse {
   const features: PageFeature[] = [];
   let index = 0;
 
-  // Smart context detection based on URL
-  const url = pageUrl.toLowerCase();
-  let limits = {
-    nav: 20,
-    products: 60,
-    inputs: 30,
-    buttons: 20
-  };
+  console.log(`📊 Context: Collecting exactly 60 inputs, 60 buttons, 60 links`);
 
-  // Adjust limits based on page type
-  if (url.includes('/product') || url.includes('/item') || url.includes('/collections') || 
-      url.includes('/shop') || url.includes('/category') || url.includes('/search')) {
-    // Product listing/detail pages - prioritize product links
-    limits = { nav: 15, products: 70, inputs: 10, buttons: 15 };
-  } else if (url.includes('/cart') || url.includes('/bag') || url.includes('/basket')) {
-    // Cart page - prioritize buttons and inputs
-    limits = { nav: 10, products: 20, inputs: 30, buttons: 40 };
-  } else if (url.includes('/checkout') || url.includes('/payment') || url.includes('/shipping')) {
-    // Checkout page - prioritize inputs and buttons
-    limits = { nav: 5, products: 5, inputs: 50, buttons: 40 };
-  } else if (url.includes('/account') || url.includes('/profile') || url.includes('/login') || url.includes('/signup')) {
-    // Account/auth pages - prioritize inputs and buttons
-    limits = { nav: 10, products: 10, inputs: 50, buttons: 30 };
-  }
-
-  console.log(`📊 Context: Using limits - nav:${limits.nav}, products:${limits.products}, inputs:${limits.inputs}, buttons:${limits.buttons}`);
-
-  // Collect navigation links first (including those in collapsed menus/dropdowns)
-  const navLinks = Array.from(document.querySelectorAll('header a[href], nav a[href], [role="navigation"] a[href], .header a[href], .nav a[href]'));
-  navLinks.slice(0, limits.nav).forEach((link) => {
+  // Collect product links FIRST, then other links
+  const productLinks = Array.from(document.querySelectorAll(
+    '.product-card a, .product-item a, .product a, ' +
+    '[class*="product"] a, [class*="item"] a, [class*="card"] a, ' +
+    'article a, [data-product] a, [data-product-handle] a'
+  ));
+  
+  console.log(`🛍️ Found ${productLinks.length} product link candidates`);
+  
+  const otherLinks = Array.from(document.querySelectorAll(
+    'a[href]'
+  ));
+  
+  console.log(`🔗 Found ${otherLinks.length} total link candidates`);
+  
+  // Combine: products first, then others
+  const allLinks = [...productLinks, ...otherLinks];
+  
+  const linkFeatures: PageFeature[] = [];
+  const seenUrls = new Set<string>();
+  let productCount = 0;
+  let otherCount = 0;
+  
+  for (const link of allLinks) {
+    if (linkFeatures.length >= 60) break; // Stop at 60 links total
+    
     const el = link as HTMLAnchorElement;
-    // For navigation, use a relaxed visibility check - just ensure it's not permanently hidden
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' && !el.closest('details, [aria-expanded]')) return; // Skip only if truly hidden, not just in a collapsed menu
+    const href = el.getAttribute('href') || '';
+    
+    // Skip duplicates
+    if (seenUrls.has(href)) continue;
+    seenUrls.add(href);
+    
+    // Strict visibility check - only visible links
+    if (!isVisible(el)) continue;
+    
+    const isProduct = productLinks.includes(link);
+    
+    if (isProduct) {
+      productCount++;
+    } else {
+      otherCount++;
+    }
     
     const text = el.innerText.trim() || el.textContent?.trim() || '';
     const ariaLabel = el.getAttribute('aria-label') || '';
-    const href = el.getAttribute('href') || '';
     
-    if (!text && !ariaLabel) return;
-    if (href.startsWith('#') && !href.includes('MainContent')) return; // Skip internal anchors except skip links
+    if (!text && !ariaLabel) continue;
+    if (href.startsWith('#') && !href.includes('MainContent')) continue;
     
     const selector = generateSelector(el);
-    features.push({
+    linkFeatures.push({
       index: index++,
       type: 'link',
       text: (text || ariaLabel).substring(0, 100),
@@ -190,13 +200,19 @@ function extractPageFeatures(): ContentResponse {
       aria_label: ariaLabel || undefined,
       already_clicked: clickedElements.has(selector),
     });
-  });
+  }
+  
+  console.log(`📊 Link collection: ${productCount} products, ${otherCount} other links`);
+  features.push(...linkFeatures);
 
-  // Collect inputs (usually most important for forms)
+  // Collect inputs (exactly 60)
   const inputs = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea, select'));
-  inputs.slice(0, limits.inputs).forEach((input) => {
+  const inputFeatures: PageFeature[] = [];
+  for (const input of inputs) {
+    if (inputFeatures.length >= 60) break; // Stop at 60 inputs
+    
     const el = input as HTMLInputElement;
-    if (!isVisible(el)) return;
+    if (!isVisible(el)) continue;
     
     const placeholder = el.getAttribute('placeholder') || '';
     const ariaLabel = el.getAttribute('aria-label') || '';
@@ -204,7 +220,7 @@ function extractPageFeatures(): ContentResponse {
     const label = findLabelFor(el);
     const selector = generateSelector(el);
     
-    features.push({
+    inputFeatures.push({
         index: index++,
       type: 'input',
       text: label || name || placeholder || el.getAttribute('type') || 'text',
@@ -214,58 +230,80 @@ function extractPageFeatures(): ContentResponse {
       value_len: typeof (el as any).value === 'string' ? ((el as any).value as string).length : 0,
       already_clicked: clickedElements.has(selector),
     });
-  });
+  }
+  features.push(...inputFeatures);
 
-  // Collect buttons
-  const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]'));
-  buttons.slice(0, limits.buttons).forEach((button) => {
-    const el = button as HTMLElement;
-    if (!isVisible(el)) return;
+  // Collect buttons - PRIORITIZE ACTION BUTTONS
+  const actionButtons = Array.from(document.querySelectorAll(
+    '.add-to-cart, .addtocart, [class*="add-to-cart"], [class*="AddToCart"], ' +
+    '[id*="add-to-cart"], [id*="AddToCart"], [name*="add"], ' +
+    'button[name="add"], button[type="submit"], ' +
+    'form[action*="cart"] button, product-form button'
+  ));
+  
+  const otherButtons = Array.from(document.querySelectorAll(
+    'button, input[type="button"], input[type="submit"], [role="button"]'
+  ));
+  
+  // Combine: action buttons first
+  const allButtons = [...actionButtons, ...otherButtons];
+  
+  console.log(`🔘 Found ${actionButtons.length} action buttons, ${otherButtons.length} total buttons`);
+  
+  const buttonFeatures: PageFeature[] = [];
+  const seenButtonSelectors = new Set<string>();
+  
+  for (const button of allButtons) {
+    if (buttonFeatures.length >= 60) break; // Stop at 60 buttons
     
-    const text = el.textContent?.trim() || (el as HTMLInputElement).value || '';
+    const el = button as HTMLElement;
+    
+    // Lenient visibility for action buttons, strict for others
+    const isActionButton = actionButtons.includes(button);
+    if (!isActionButton && !isVisible(el)) continue;
+    
+    // For action buttons, allow if at least has dimensions OR is in DOM
+    if (isActionButton) {
+      const rect = el.getBoundingClientRect();
+      const hasSize = rect.width > 0 || rect.height > 0;
+      const inDOM = document.body.contains(el);
+      if (!hasSize && !inDOM) continue;
+    }
+    
+    // Get clean text by removing style, script, and SVG content
+    let text = '';
+    const clone = el.cloneNode(true) as HTMLElement;
+    // Remove style, script, and SVG elements
+    clone.querySelectorAll('style, script, svg').forEach(n => n.remove());
+    text = clone.textContent?.trim() || (el as HTMLInputElement).value || '';
+    
     const ariaLabel = el.getAttribute('aria-label') || '';
-    if (!text && !ariaLabel) return;
+    const buttonName = el.getAttribute('name') || '';
+    
+    // Skip if text looks like CSS or contains obvious CSS markers
+    if (text.includes('.cls-') || text.includes('{') || text.includes('fill:') || text.includes('stroke:')) {
+      continue;
+    }
+    if (!text && !ariaLabel && !buttonName) continue;
     
     const selector = generateSelector(el);
-    features.push({
+    // Skip duplicate buttons
+    if (seenButtonSelectors.has(selector)) continue;
+    seenButtonSelectors.add(selector);
+    
+    if (isActionButton) {
+      console.log(`✅ Action button: "${text || ariaLabel || buttonName}"`);
+    }
+    buttonFeatures.push({
         index: index++,
         type: 'button',
-      text: (text || ariaLabel).substring(0, 100),
+      text: (text || ariaLabel || buttonName).substring(0, 100),
       selector,
       aria_label: ariaLabel || undefined,
       already_clicked: clickedElements.has(selector),
     });
-  });
-
-  // Collect other links (non-navigation) - PRIORITIZE PRODUCT CARDS
-  // Look for product cards, images with links, article links, etc.
-  const links = Array.from(document.querySelectorAll(
-    'a[href]:not(header a):not(nav a), ' +
-    '.product-card a, .product-item a, .product a, ' +
-    '[class*="product"] a, [class*="item"] a, ' +
-    'article a, .card a, [data-product] a'
-  ));
-  links.slice(0, limits.products).forEach((link) => {
-    const el = link as HTMLAnchorElement;
-    // Skip if already collected as nav link
-    if (el.closest('header, nav, [role="navigation"], .header, .nav')) return;
-    if (!isVisible(el)) return;
-    
-    const text = el.innerText.trim() || el.textContent?.trim() || '';
-    const ariaLabel = el.getAttribute('aria-label') || '';
-    const href = el.getAttribute('href') || '';
-    
-    if (!text && !ariaLabel) return;
-    
-    features.push({
-      index: index++,
-      type: 'link',
-      text: (text || ariaLabel).substring(0, 100),
-      selector: generateSelector(el),
-      href: href || undefined,
-      aria_label: ariaLabel || undefined,
-    });
-  });
+  }
+  features.push(...buttonFeatures);
 
   // Deduplicate based on text + type
   const seen = new Set<string>();
@@ -281,8 +319,41 @@ function extractPageFeatures(): ContentResponse {
     f.index = idx;
   });
 
-  // Simplified logging - only show summary unless explicitly expanded
-  console.log(`[Big Brother] Extracted ${uniqueFeatures.length} interactive elements ${pageUrl}`);
+  // Debug log: what the agent can "see"
+  try {
+    console.groupCollapsed(
+      `[Big Brother] Extracted ${uniqueFeatures.length} interactive elements`,
+      pageUrl
+    );
+    console.table(
+      uniqueFeatures.map((f) => ({
+        index: f.index,
+        type: f.type,
+        text: f.text,
+        placeholder: f.placeholder || '',
+        aria_label: f.aria_label || '',
+        href: f.href || '',
+        value_len: f.value_len ?? 0,
+        selector: f.selector,
+      }))
+    );
+    console.groupEnd();
+  } catch {
+    console.log(`Extracted ${uniqueFeatures.length} features from page`);
+  }
+
+  // Detailed logging of extracted features
+  console.group(`🔍 DOM EXTRACTION - ${uniqueFeatures.length} elements`);
+  console.log('📍 URL:', pageUrl);
+  uniqueFeatures.forEach((f, i) => {
+    const clickedFlag = f.already_clicked ? '✓ CLICKED' : '';
+    console.log(
+      `[${i}] ${f.type.toUpperCase()} ${clickedFlag}:`,
+      f.text || f.placeholder || f.aria_label || '(no text)',
+      f.selector
+    );
+  });
+  console.groupEnd();
 
   return {
     success: true,
