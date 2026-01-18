@@ -585,7 +585,7 @@ class GraphService:
         OPTIONAL MATCH (pr)-[:HAS_STEP]->(step:Step)
         WITH pr, p, collect(step) AS steps
         RETURN pr, p.url AS source_url, p.title AS source_title,
-               [s IN steps | {id: s.id, index: s.step_index, instruction: s.instruction, action_type: s.action_type}] AS steps
+               [s IN steps | {id: s.id, index: s.step_index, instruction: s.instruction, action_type: s.action_type, selector_hint: s.selector_hint, expected_state: s.expected_state}] AS steps
         ORDER BY pr.created_at DESC
         """
         

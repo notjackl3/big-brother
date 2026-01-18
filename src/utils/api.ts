@@ -162,3 +162,153 @@ export async function healthCheck(): Promise<boolean> {
     return false;
   }
 }
+
+// ============================================
+// Context Graph / Procedures API
+// ============================================
+
+export interface ProcedureStep {
+  id: string;
+  index: number;
+  instruction: string;
+  action_type: 'click' | 'type' | 'navigate' | 'wait';
+  selector_hint?: string | null;
+  expected_state?: string | null;
+}
+
+export interface Procedure {
+  id: string;
+  goal: string;
+  source_text?: string;
+  steps: ProcedureStep[];
+}
+
+// Known company IDs for different platforms
+export const KNOWN_COMPANIES: Record<string, string> = {
+  'amplitude.com': 'cc410d4f-b927-4d6e-a972-b78c4ba50a0c',
+  'analytics.amplitude.com': 'cc410d4f-b927-4d6e-a972-b78c4ba50a0c',
+};
+
+/**
+ * Get company ID based on current URL
+ */
+export function getCompanyIdFromUrl(url: string): string | null {
+  try {
+    const hostname = new URL(url).hostname;
+    for (const [domain, companyId] of Object.entries(KNOWN_COMPANIES)) {
+      if (hostname.includes(domain)) {
+        return companyId;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Get all procedures for a company
+ */
+export async function getProcedures(companyId: string): Promise<Procedure[]> {
+  const response = await fetch(`${API_BASE_URL}/api/companies/${companyId}/procedures`);
+  
+  if (!response.ok) {
+    throw new ApiError(response.status, `Failed to get procedures`);
+  }
+  
+  return response.json();
+}
+
+/**
+ * Find the best matching procedure for a user goal
+ */
+export async function findMatchingProcedure(
+  companyId: string,
+  userGoal: string
+): Promise<Procedure | null> {
+  try {
+    const procedures = await getProcedures(companyId);
+    
+    if (!procedures || procedures.length === 0) {
+      return null;
+    }
+    
+    // Simple keyword matching - find best match
+    const goalLower = userGoal.toLowerCase();
+    
+    let bestMatch: Procedure | null = null;
+    let bestScore = 0;
+    
+    for (const proc of procedures) {
+      const procGoalLower = proc.goal.toLowerCase();
+      
+      // Count matching words
+      const goalWords = goalLower.split(/\s+/);
+      const matchingWords = goalWords.filter(word => 
+        procGoalLower.includes(word) && word.length > 2
+      );
+      
+      const score = matchingWords.length;
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestMatch = proc;
+      }
+    }
+    
+    // Require at least 1 matching word
+    if (bestScore >= 1) {
+      return bestMatch;
+    }
+    
+    return null;
+  } catch (error) {
+    console.error('Error finding procedure:', error);
+    return null;
+  }
+}
+
+/**
+ * Convert a procedure step to a PlannedStep format
+ */
+export function procedureStepToPlannedStep(
+  step: ProcedureStep,
+  stepNumber: number
+): PlannedStep {
+  const actionMap: Record<string, PlannedStep['action']> = {
+    'click': 'CLICK',
+    'type': 'TYPE',
+    'navigate': 'CLICK',
+    'wait': 'WAIT',
+  };
+  
+  // Extract key terms from instruction for text matching
+  const instruction = step.instruction;
+  const quotedTerms: string[] = [];
+  const quoteMatches = instruction.match(/'([^']+)'/g);
+  if (quoteMatches) {
+    quoteMatches.forEach(m => quotedTerms.push(m.replace(/'/g, '')));
+  }
+  
+  // Also get important words (longer than 4 chars, not common words)
+  const commonWords = ['click', 'select', 'enter', 'navigate', 'go to', 'from', 'the', 'your', 'this', 'that', 'with', 'for'];
+  const keywords = instruction.toLowerCase().split(/\s+/)
+    .filter(w => w.length > 4 && !commonWords.includes(w));
+  
+  const textContains = [...quotedTerms, ...keywords.slice(0, 5)];
+  
+  return {
+    step_number: stepNumber,
+    action: actionMap[step.action_type] || 'CLICK',
+    description: step.instruction,
+    target_hints: {
+      text_contains: textContains,
+      selector_pattern: step.selector_hint || undefined,
+    },
+    text_input: undefined,
+    expected_page_change: step.action_type === 'navigate' || 
+      instruction.toLowerCase().includes('submit') ||
+      instruction.toLowerCase().includes('create') ||
+      instruction.toLowerCase().includes('save'),
+  };
+}

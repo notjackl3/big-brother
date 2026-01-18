@@ -1,6 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { sendMessageToContent } from '../utils/messaging';
-import { startSession, getNextAction, type PlannedStep, type PageFeature, ApiError } from '../utils/api';
+import { 
+  startSession, 
+  getNextAction, 
+  type PlannedStep, 
+  type PageFeature, 
+  ApiError,
+  getCompanyIdFromUrl,
+  findMatchingProcedure,
+  procedureStepToPlannedStep
+} from '../utils/api';
 import type { Message, AgentStatus, ContentResponse } from '../types/messages';
 import HealthySnacks from './HealthySnacks';
 
@@ -14,6 +23,7 @@ interface SessionState {
   awaitingConfirmation: boolean; // Are we waiting for user to type "Y"?
   isExecuting: boolean; // Is execution in progress?
   executionError?: string;
+  usingProcedure?: boolean; // Are we using documented procedure steps?
 }
 
 // Extend Window interface for Web Speech API
@@ -380,6 +390,55 @@ const SidePanel: React.FC = () => {
       
       addAgentMessage(`📋 Found **${features.length}** interactive elements on this page.`);
 
+      // Check if we're on a known site with procedures (e.g., Amplitude)
+      const companyId = getCompanyIdFromUrl(pageUrl || window.location.href);
+      
+      if (companyId) {
+        addAgentMessage('📚 Checking documentation for this site...');
+        
+        const matchingProcedure = await findMatchingProcedure(companyId, userGoal);
+        
+        if (matchingProcedure) {
+          addAgentMessage(`✅ Found a matching procedure: **${matchingProcedure.goal}**`);
+          
+          // Convert procedure steps to planned steps
+          const plannedSteps = matchingProcedure.steps.map((step, idx) => 
+            procedureStepToPlannedStep(step, idx + 1)
+          );
+          
+          // Create a session with the procedure steps
+          const sessionResponse = await startSession({
+            user_goal: userGoal,
+            initial_page_features: features as PageFeature[],
+            url: pageUrl || window.location.href,
+            page_title: pageTitle || 'Unknown Page',
+          });
+          
+          // Override with procedure steps - mark as using procedure
+          setSession({
+            sessionId: sessionResponse.session_id,
+            plannedSteps: plannedSteps,
+            currentStepIndex: 0,
+            totalSteps: plannedSteps.length,
+            awaitingConfirmation: true,
+            isExecuting: false,
+            usingProcedure: true, // Use procedure steps directly, don't ask backend
+          });
+          
+          const stepsMessage = formatPlannedSteps(plannedSteps);
+          addAgentMessage(
+            `📝 **Following documented procedure:**\n\n` +
+            `${stepsMessage}\n\n` +
+            `---\n` +
+            `**Total steps: ${plannedSteps.length}** (from documentation)`
+          );
+          
+          addAgentMessage('👆 **Type Y to proceed with this procedure, or N to cancel.**');
+          setStatus('idle');
+          return;
+        }
+      }
+
       // Step 2: Send to backend to generate workflow with Gemini
       addAgentMessage('🤖 Asking AI to plan the steps...');
       setStatus('acting');
@@ -641,31 +700,155 @@ const SidePanel: React.FC = () => {
           previousError = manualBeforeNext.note || 'Manual advance';
         }
 
-        // Ask backend what the next step is (backend advances only when previousSuccess=true)
-        const nextAction = await getNextAction({
-          session_id: currentSession.sessionId,
-          page_features: featuresResponse.features as PageFeature[],
-          url: featuresResponse.pageUrl || window.location.href,
-          page_title: featuresResponse.pageTitle || document.title,
-          previous_action_result: { success: previousSuccess, error: previousError },
-        });
+        // Track current step index for procedures
+        let currentStepIdx = currentSession.currentStepIndex;
+        
+        // If using a procedure, use steps directly instead of asking backend
+        let stepIndex: number;
+        let action: 'CLICK' | 'TYPE' | 'SCROLL' | 'WAIT' | 'DONE';
+        let instruction: string;
+        let textInput: string | undefined;
+        let expectChange: boolean;
+        let totalSteps: number;
+        let targetFeatureIndex: number | null = null;
+        let targetFeature: PageFeature | null = null;
+        let confidence = 0.8;
 
-        const stepIndex = Math.max(0, (nextAction.step_number || 1) - 1);
-        const step = steps[stepIndex];
-        const action = nextAction.action as 'CLICK' | 'TYPE' | 'SCROLL' | 'WAIT' | 'DONE';
-        const instruction = nextAction.instruction || step?.description || '';
-        const textInput = step?.text_input ?? nextAction.text_input;
-        const expectChange = Boolean(nextAction.expected_page_change);
+        if (currentSession.usingProcedure) {
+          // Use procedure steps directly
+          stepIndex = currentStepIdx;
+          totalSteps = steps.length;
+          
+          // Check if we're done
+          if (stepIndex >= steps.length) {
+            addAgentMessage('🎉 **All procedure steps completed!** Your goal has been achieved.');
+            break;
+          }
+          
+          const step = steps[stepIndex];
+          action = step.action;
+          instruction = step.description;
+          textInput = step.text_input;
+          expectChange = step.expected_page_change;
+          
+          // Find matching element on page using step hints
+          const features = featuresResponse.features as PageFeature[];
+          const hints = step.target_hints;
+          
+          // Log what we're looking for
+          console.log(`[Procedure] Step ${stepIndex + 1}: "${instruction}"`);
+          console.log(`[Procedure] Page URL: ${featuresResponse.pageUrl}`);
+          console.log(`[Procedure] Found ${features.length} elements on page`);
+          
+          // Log first few relevant elements
+          const relevantElements = features.slice(0, 20).map((f, i) => 
+            `  ${i}: [${f.type}] "${f.text?.slice(0, 40) || f.aria_label?.slice(0, 40) || 'no text'}"`
+          );
+          console.log(`[Procedure] Elements:\n${relevantElements.join('\n')}`);
+          
+          // Extract quoted terms from instruction (e.g., 'Funnel Analysis')
+          const quotedTerms: string[] = [];
+          const quoteMatches = instruction.match(/'([^']+)'/g);
+          if (quoteMatches) {
+            quoteMatches.forEach(m => quotedTerms.push(m.replace(/'/g, '').toLowerCase()));
+          }
+          console.log(`[Procedure] Looking for quoted terms: ${quotedTerms.join(', ')}`);
+          console.log(`[Procedure] Hints: ${JSON.stringify(hints)}`);
+          
+          // Try to find matching element - prioritize exact quoted matches
+          let bestMatch: { index: number; feature: PageFeature; score: number } | null = null;
+          
+          for (let i = 0; i < features.length; i++) {
+            const f = features[i];
+            const text = (f.text || '').toLowerCase();
+            const ariaLabel = (f.aria_label || '').toLowerCase();
+            const fullText = `${text} ${ariaLabel}`;
+            
+            let score = 0;
+            
+            // Check for exact quoted term matches (highest priority)
+            for (const term of quotedTerms) {
+              if (text === term || ariaLabel === term) {
+                score += 100; // Exact match
+              } else if (fullText.includes(term)) {
+                score += 50; // Contains the term
+              }
+            }
+            
+            // Check text_contains hints
+            const textMatches = hints.text_contains?.filter(t => 
+              fullText.includes(t.toLowerCase())
+            ).length || 0;
+            score += textMatches * 10;
+            
+            // Bonus for matching element type based on action
+            if (action === 'CLICK' && (f.type === 'button' || f.type === 'link')) {
+              score += 5;
+            }
+            
+            // Selector pattern match
+            if (hints.selector_pattern && f.selector?.includes(hints.selector_pattern)) {
+              score += 20;
+            }
+            
+            if (score > 0 && (!bestMatch || score > bestMatch.score)) {
+              bestMatch = { index: i, feature: f, score };
+            }
+          }
+          
+          if (bestMatch && bestMatch.score >= 10) {
+            targetFeatureIndex = bestMatch.index;
+            targetFeature = bestMatch.feature;
+            confidence = Math.min(0.99, bestMatch.score / 100);
+          }
+          
+          // If no match found, try fuzzy matching on instruction keywords
+          if (targetFeatureIndex === null) {
+            const keywords = instruction.toLowerCase().split(/\s+/).filter(w => w.length > 3);
+            for (let i = 0; i < features.length; i++) {
+              const f = features[i];
+              const text = `${f.text || ''} ${f.aria_label || ''} ${f.placeholder || ''}`.toLowerCase();
+              const matchCount = keywords.filter(k => text.includes(k)).length;
+              if (matchCount >= 2 || (matchCount === 1 && keywords.length <= 3)) {
+                targetFeatureIndex = i;
+                targetFeature = f;
+                confidence = 0.5;
+                break;
+              }
+            }
+          }
+          
+        } else {
+          // Use backend for non-procedure execution
+          const nextAction = await getNextAction({
+            session_id: currentSession.sessionId,
+            page_features: featuresResponse.features as PageFeature[],
+            url: featuresResponse.pageUrl || window.location.href,
+            page_title: featuresResponse.pageTitle || document.title,
+            previous_action_result: { success: previousSuccess, error: previousError },
+          });
 
-        // DONE / complete
-        if (action === 'DONE' || nextAction.session_complete) {
-          addAgentMessage('🎉 **All steps completed!** Your goal has been achieved.');
-          break;
+          stepIndex = Math.max(0, (nextAction.step_number || 1) - 1);
+          const step = steps[stepIndex];
+          action = nextAction.action as 'CLICK' | 'TYPE' | 'SCROLL' | 'WAIT' | 'DONE';
+          instruction = nextAction.instruction || step?.description || '';
+          textInput = step?.text_input ?? nextAction.text_input;
+          expectChange = Boolean(nextAction.expected_page_change);
+          totalSteps = nextAction.total_steps;
+          targetFeatureIndex = nextAction.target_feature_index;
+          targetFeature = nextAction.target_feature;
+          confidence = nextAction.confidence;
+          
+          // DONE / complete
+          if (action === 'DONE' || nextAction.session_complete) {
+            addAgentMessage('🎉 **All steps completed!** Your goal has been achieved.');
+            break;
+          }
         }
 
         // Show current step
         addAgentMessage(
-          `\n**Step ${nextAction.step_number}/${nextAction.total_steps}:** ${getActionIcon(action)} ${action}\n` +
+          `\n**Step ${stepIndex + 1}/${totalSteps}:** ${getActionIcon(action)} ${action}\n` +
           `${instruction}` +
           (textInput ? `\n└─ Text: "${textInput}"` : '')
         );
@@ -676,7 +859,7 @@ const SidePanel: React.FC = () => {
             ? {
                 ...prev,
                 currentStepIndex: stepIndex,
-                totalSteps: nextAction.total_steps,
+                totalSteps: totalSteps,
               }
             : null
         );
@@ -751,30 +934,48 @@ const SidePanel: React.FC = () => {
           continue;
         }
 
-        if (nextAction.target_feature_index === null) {
+        if (targetFeatureIndex === null) {
           // No matching element found - show what we're looking for
           addAgentMessage(
             `⚠️ **Could not find the right element.**\n` +
             `Looking for: ${instruction}\n` +
-            `Try scrolling or waiting for the page to load.`
+            `Please navigate to the right page or scroll to find the element.`
           );
           
-          // Highlight nothing, wait a bit and retry
-          await delay(1500);
+          // Wait and retry - do NOT advance
+          await delay(3000);
+          
+          // After 3 failed attempts, stop and ask user
+          const retryCount = (currentSession as any).retryCount || 0;
+          if (retryCount >= 3) {
+            addAgentMessage(
+              `❌ **Cannot find element after 3 attempts.**\n` +
+              `Please manually perform: "${instruction}"\n` +
+              `Then press "Next step" to continue.`
+            );
+            setStatus('idle');
+            return;
+          }
+          
+          // Increment retry counter
+          (currentSession as any).retryCount = retryCount + 1;
           continue;
         }
+        
+        // Reset retry counter on success
+        (currentSession as any).retryCount = 0;
 
         // Highlight the target element
         addAgentMessage(
-          `🎯 Found element: **${nextAction.target_feature?.text || 'Unknown'}** ` +
-          `(${nextAction.target_feature?.type}, confidence: ${Math.round(nextAction.confidence * 100)}%)`
+          `🎯 Found element: **${targetFeature?.text || 'Unknown'}** ` +
+          `(${targetFeature?.type}, confidence: ${Math.round(confidence * 100)}%)`
         );
 
         await sendMessageToContent({
           type: 'HIGHLIGHT_ELEMENT',
           payload: {
-            targetIndex: nextAction.target_feature_index ?? undefined,
-            selector: nextAction.target_feature?.selector,
+            targetIndex: targetFeatureIndex ?? undefined,
+            selector: targetFeature?.selector,
             // Keep the highlight until the next step (or until we clear highlights).
             duration: 0,
           },
@@ -787,7 +988,7 @@ const SidePanel: React.FC = () => {
         // Track this action (no warning needed - AI already sees already_clicked flag)
         recentActions.push({
           action,
-          targetText: nextAction.target_feature?.text || '',
+          targetText: targetFeature?.text || '',
           url: prevUrl,
         });
         
@@ -805,7 +1006,7 @@ const SidePanel: React.FC = () => {
             type: 'EXECUTE_ACTION',
             payload: {
               action: 'CLICK',
-              targetIndex: nextAction.target_feature_index ?? null,
+              targetIndex: targetFeatureIndex ?? null,
             },
             target: 'content',
           });
@@ -821,6 +1022,12 @@ const SidePanel: React.FC = () => {
           addAgentMessage(`✅ Successfully clicked the element.`);
           previousSuccess = true;
           previousError = undefined;
+
+          // Advance to next step for procedures
+          if (currentSession.usingProcedure) {
+            setSession((prev) => prev ? { ...prev, currentStepIndex: prev.currentStepIndex + 1 } : null);
+            currentSession.currentStepIndex++;
+          }
 
           // Wait for page update if expected
           if (expectChange) {
@@ -839,7 +1046,7 @@ const SidePanel: React.FC = () => {
             type: 'EXECUTE_ACTION',
             payload: {
               action: 'TYPE',
-              targetIndex: nextAction.target_feature_index ?? null,
+              targetIndex: targetFeatureIndex ?? null,
               textInput: textInput || '',
             },
             target: 'content',
@@ -856,8 +1063,12 @@ const SidePanel: React.FC = () => {
           addAgentMessage(`✅ Successfully typed into the field.`);
           previousSuccess = true;
           previousError = undefined;
-          previousSuccess = true;
-          previousError = undefined;
+
+          // Advance to next step for procedures
+          if (currentSession.usingProcedure) {
+            setSession((prev) => prev ? { ...prev, currentStepIndex: prev.currentStepIndex + 1 } : null);
+            currentSession.currentStepIndex++;
+          }
 
           if (expectChange) {
             await waitForPageUpdate({
@@ -871,15 +1082,15 @@ const SidePanel: React.FC = () => {
           // For other actions (SCROLL, WAIT with element, etc.), use guidance mode
           addAgentMessage(
             `👆 **Please ${(action as string).toLowerCase()} this element:**\n` +
-            `${nextAction.target_feature?.text || instruction}`
+            `${targetFeature?.text || instruction}`
           );
 
           const eventReceived = await sendMessageToContent({
             type: 'WAIT_FOR_EVENT',
             payload: {
               action,
-              targetIndex: nextAction.target_feature_index ?? undefined,
-              selector: nextAction.target_feature?.selector,
+              targetIndex: targetFeatureIndex ?? undefined,
+              selector: targetFeature?.selector,
             },
             target: 'content',
           });
@@ -888,10 +1099,22 @@ const SidePanel: React.FC = () => {
             addAgentMessage('⚠️ No interaction detected. Moving on...');
             previousSuccess = false;
             previousError = 'User interaction timeout';
+            
+            // For procedures, advance anyway
+            if (currentSession.usingProcedure) {
+              setSession((prev) => prev ? { ...prev, currentStepIndex: prev.currentStepIndex + 1 } : null);
+              currentSession.currentStepIndex++;
+            }
           } else {
             addAgentMessage('✅ Action completed!');
             previousSuccess = true;
             previousError = undefined;
+            
+            // Advance to next step for procedures
+            if (currentSession.usingProcedure) {
+              setSession((prev) => prev ? { ...prev, currentStepIndex: prev.currentStepIndex + 1 } : null);
+              currentSession.currentStepIndex++;
+            }
           }
 
           if (expectChange) {

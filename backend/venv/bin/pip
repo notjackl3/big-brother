@@ -1,4 +1,6 @@
-#!/Users/notjackl3/Desktop/CODING/uoft-hacks/uoft-hacks/backend/venv/bin/python
+#!/bin/sh
+'''exec' "/Users/arjunvirk/Desktop/UofT Hacks/uoft-hacks-1/backend/venv/bin/python3.12" "$0" "$@"
+' '''
 # -*- coding: utf-8 -*-
 import re
 import sys
