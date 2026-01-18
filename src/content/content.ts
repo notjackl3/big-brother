@@ -138,7 +138,7 @@ function extractPageFeatures(): ContentResponse {
   const features: PageFeature[] = [];
   let index = 0;
 
-  console.log(`📊 Context: Collecting exactly 60 inputs, 60 buttons, 60 links`);
+  console.log(`📊 Context: Collecting up to 75 inputs, 75 buttons, 75 links`);
 
   // Collect product links FIRST, then other links
   const productLinks = Array.from(document.querySelectorAll(
@@ -150,13 +150,20 @@ function extractPageFeatures(): ContentResponse {
   console.log(`🛍️ Found ${productLinks.length} product link candidates`);
   
   const otherLinks = Array.from(document.querySelectorAll(
-    'a[href]:not(header a):not(footer a):not(nav a):not([role="navigation"] a)'
+    'a[href]:not(footer a):not(nav a):not([role="navigation"] a)'
   ));
   
-  console.log(`🔗 Found ${otherLinks.length} total link candidates (excluding header/footer/nav)`);
+  // Also specifically collect cart/checkout links from header (important for checkout flow)
+  const cartLinks = Array.from(document.querySelectorAll(
+    'header a[href*="cart"], header a[href*="checkout"], ' +
+    '[class*="cart"] a, [id*="cart"] a, [aria-label*="cart" i] a'
+  ));
   
-  // Combine: products first, then others
-  const allLinks = [...productLinks, ...otherLinks];
+  console.log(`🔗 Found ${otherLinks.length} total link candidates (excluding footer/nav)`);
+  console.log(`🛒 Found ${cartLinks.length} cart/checkout links`);
+  
+  // Combine: products first, cart links, then others
+  const allLinks = [...productLinks, ...cartLinks, ...otherLinks];
   
   const linkFeatures: PageFeature[] = [];
   const seenUrls = new Set<string>();
@@ -164,23 +171,36 @@ function extractPageFeatures(): ContentResponse {
   let otherCount = 0;
   
   for (const link of allLinks) {
-    if (linkFeatures.length >= 60) break; // Stop at 60 links total
+    if (linkFeatures.length >= 75) break; // Stop at 75 links total
     
     const el = link as HTMLAnchorElement;
     const href = el.getAttribute('href') || '';
     
-    // Skip invalid or nav links
+    // Skip invalid links
     if (!href || href.startsWith('javascript:') || href === '#') continue;
-    if (el.closest('header, footer, nav, [role="navigation"]')) continue;
+    
+    // Allow cart/checkout links even from header/nav
+    const isCartLink = href.includes('/cart') || href.includes('/checkout') || 
+                       el.textContent?.toLowerCase().includes('cart') ||
+                       el.getAttribute('aria-label')?.toLowerCase().includes('cart');
+    
+    // Skip header/footer/nav UNLESS it's a cart link
+    if (!isCartLink && el.closest('header, footer, nav, [role="navigation"]')) continue;
     
     // Skip duplicates
     if (seenUrls.has(href)) continue;
     seenUrls.add(href);
     
-    // Strict visibility check - only visible links
-    if (!isVisible(el)) continue;
-    
     const isProduct = productLinks.includes(link);
+    
+    // For product links, be very lenient with visibility (just check not display:none)
+    // For other links, use strict visibility
+    if (isProduct) {
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none') continue;
+    } else {
+      if (!isVisible(el)) continue;
+    }
     
     if (isProduct) {
       productCount++;
@@ -191,14 +211,18 @@ function extractPageFeatures(): ContentResponse {
     const text = el.innerText.trim() || el.textContent?.trim() || '';
     const ariaLabel = el.getAttribute('aria-label') || '';
     
-    if (!text && !ariaLabel) continue;
+    // Allow product links with no text (image-only products) by checking href
+    const hasProductUrl = href.includes('/products/') || href.includes('/product/');
+    if (!text && !ariaLabel && !hasProductUrl) continue;
     if (href.startsWith('#') && !href.includes('MainContent')) continue;
     
     const selector = generateSelector(el);
+    // For image-only products, extract name from URL
+    const displayText = text || ariaLabel || href.split('/').pop()?.replace(/-/g, ' ') || 'Product';
     linkFeatures.push({
       index: index++,
       type: 'link',
-      text: (text || ariaLabel).substring(0, 100),
+      text: displayText.substring(0, 100),
       selector,
       href: href || undefined,
       aria_label: ariaLabel || undefined,
@@ -262,17 +286,11 @@ function extractPageFeatures(): ContentResponse {
     
     const el = button as HTMLElement;
     
-    // Lenient visibility for action buttons, strict for others
-    const isActionButton = actionButtons.includes(button);
-    if (!isActionButton && !isVisible(el)) continue;
+    // Check visibility - more lenient now
+    if (!isVisible(el)) continue;
     
-    // For action buttons, allow if at least has dimensions OR is in DOM
-    if (isActionButton) {
-      const rect = el.getBoundingClientRect();
-      const hasSize = rect.width > 0 || rect.height > 0;
-      const inDOM = document.body.contains(el);
-      if (!hasSize && !inDOM) continue;
-    }
+    // Track if this is an action button for logging
+    const isActionButton = actionButtons.includes(button);
     
     // Get clean text by removing style, script, and SVG content
     let text = '';
@@ -442,12 +460,11 @@ function isVisible(element: HTMLElement): boolean {
   const style = window.getComputedStyle(element);
   const rect = element.getBoundingClientRect();
   
+  // More lenient: allow 0 dimensions as long as element is in DOM and not hidden
   return (
     style.display !== 'none' &&
     style.visibility !== 'hidden' &&
-    style.opacity !== '0' &&
-    rect.width > 0 &&
-    rect.height > 0
+    parseFloat(style.opacity) > 0.1  // Allow low opacity (not completely transparent)
   );
 }
 

@@ -68,16 +68,19 @@ CRITICAL RULES:
   - If elements suggest the user is already logged in (e.g. "Log out", "Settings", profile/account links), plan steps to log out first.
   - Otherwise plan steps to create a new account (sign up).
 - Each step must be one atomic action: CLICK, TYPE, SCROLL, WAIT, DONE.
-- AVOID LOOPS: If a single action would complete the goal (e.g., clicking one navigation link), generate ONLY that action followed by DONE
+- AVOID LOOPS AND PAGINATION: If a single action would complete the goal, generate ONLY that action followed by DONE
   - Never generate multiple identical or redundant steps
   - After clicking a navigation link, the next plan should recognize the URL changed and either continue or finish
-  - PAGINATION WARNING: NEVER repeatedly click "next", "previous", or page number links without a specific reason
-  - If you need to find items, use category navigation (e.g., Women > Skirts) or search instead of pagination
-  - Clicking "next" should only be a last resort if the specific item/category is not found on the current page
-- NAVIGATION STRATEGY: When looking for specific items (e.g., "buy skirts", "find jewelry"):
-  - PREFER: Category navigation links (Women > Skirts, Shop > Accessories)
-  - SECOND CHOICE: Search functionality (type query, then click search)
-  - LAST RESORT: Pagination (clicking "next" to browse pages)
+  - ⚠️ **PAGINATION LOOP PREVENTION**: NEVER click "next", "previous", or page number links repeatedly
+  - If you see product links in ELEMENTS_JSON, CLICK THEM DIRECTLY - do NOT click pagination
+  - Example: Goal "buy earrings" + Elements show "Gold Hoop Earrings" link → CLICK that link, NOT "next"
+  - Only click pagination if absolutely no relevant product links are visible AND you've never clicked pagination before
+  - If you already clicked "next" or "previous" once, STOP and report "Cannot find matching products"
+- NAVIGATION STRATEGY: When looking for specific items (e.g., "buy earrings", "find jewelry"):
+  - PREFER: Direct product links (e.g., "Gold Hoop Earrings", "Silver Studs")
+  - SECOND CHOICE: Category navigation links (Women > Accessories)
+  - THIRD CHOICE: Search functionality (type query, then click search)
+  - LAST RESORT NEVER USE: Pagination (clicking "next" to browse pages)
 - SEARCH HANDLING: When the goal involves searching (e.g., "buy hats", "find jewelry"):
   - DO NOT repeatedly click search links/buttons without typing first
   - Look for INPUT elements with type="input" and placeholder/aria_label containing "search"
@@ -87,6 +90,10 @@ CRITICAL RULES:
 - Every CLICK/TYPE step MUST include target_hints with:
   - type (input/button/link)
   - AND at least one anchor: text_contains OR placeholder_contains OR selector_pattern.
+  - EXACT WORD MATCHING: When matching element text, prefer EXACT word matches over substring matches
+    * Example: For goal "buy a ring", prefer "Rings (16)" over "Earrings (62)"
+    * Use whole-word matching: "ring" should match "ring" or "rings" but NOT "earrings" or "string"
+    * When specifying text_contains, use the most specific text that avoids false matches
 - In target_hints, text_contains and placeholder_contains MUST be JSON arrays (use [] if none). Never use null.
 - TYPE steps MUST include text_input.
   - If the goal requires unknown personal info (email/phone/password), use placeholders like "<EMAIL>", "<PASSWORD>" and say so in the description.

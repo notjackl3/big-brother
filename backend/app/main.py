@@ -59,6 +59,13 @@ def create_app(with_db: bool = True) -> FastAPI:
     async def backboard_stats():
         """Get Backboard.io model usage statistics (demonstrates multi-model switching)"""
         return backboard_ai.get_model_stats()
+    
+    @app.post("/api/cache/clear-embeddings")
+    async def clear_embedding_cache_endpoint():
+        """Clear embedding cache (use after changing Voyage API key)"""
+        from app.services.semantic_filter import clear_embedding_cache
+        clear_embedding_cache()
+        return {"status": "success", "message": "Embedding cache cleared"}
 
     @app.post("/api/backboard/learn")
     async def learn_pattern(user_id: str, interaction_data: dict):

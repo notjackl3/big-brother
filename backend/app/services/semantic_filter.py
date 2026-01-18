@@ -16,7 +16,15 @@ USE_SEMANTIC_FILTER = True
 SIMILARITY_THRESHOLD = 0.3  # Minimum similarity score to include
 
 # In-memory cache for embeddings (keyed by text hash)
+# CLEAR THIS if you change Voyage API key
 _embedding_cache: Dict[str, List[float]] = {}
+
+
+def clear_embedding_cache():
+    """Clear the embedding cache - call this if Voyage API key changes"""
+    global _embedding_cache
+    _embedding_cache.clear()
+    logger.info("🗑️ Cleared embedding cache (old API key embeddings removed)")
 
 
 def _get_cache_key(text: str) -> str:
@@ -104,14 +112,23 @@ async def semantic_filter_features(
     try:
         logger.info(f"🔍 Semantic filtering {len(features)} features for goal: {user_goal[:50]}...")
         
-        # Analyze goal to detect if it's product-focused
+        # Analyze goal to detect if it's product-focused AND extract key terms
         goal_lower = user_goal.lower()
         is_product_focused = any(kw in goal_lower for kw in [
             'buy', 'purchase', 'find', 'looking for', 'search for', 'add to cart',
             'trouser', 'pant', 'skirt', 'dress', 'shirt', 'shoe', 'jacket', 'item',
-            'product', 'price', '$', 'shop', 'clothing', 'apparel'
+            'product', 'price', '$', 'shop', 'clothing', 'apparel', 'ring', 'necklace',
+            'bracelet', 'earring'
         ])
-        logger.info(f"🎯 Goal analysis: product_focused={is_product_focused}")
+        
+        # Extract key product terms from goal for exact matching
+        product_terms = ['ring', 'rings', 'necklace', 'necklaces', 'bracelet', 'bracelets',
+                        'earring', 'earrings', 'trouser', 'trousers', 'pant', 'pants',
+                        'skirt', 'skirts', 'dress', 'dresses', 'shirt', 'shirts', 'jacket', 'jackets',
+                        'jewelry', 'jewellery']
+        goal_key_terms = [term for term in product_terms if term in goal_lower]
+        
+        logger.info(f"🎯 Goal analysis: product_focused={is_product_focused}, key_terms={goal_key_terms}")
         
         # Build text representations
         feature_texts = []
@@ -139,12 +156,14 @@ async def semantic_filter_features(
                             'collection', 'apparel', 'clothing', 'accessories', 'jewelry', 
                             'shoes', 'dress', 'skirt', 'pant', 'shirt', 'top', 'bottom']
         action_keywords = ['add to cart', 'add to bag', 'buy now', 'purchase', 'checkout', 
-                          'add', 'submit', 'continue', 'proceed', 'confirm', 'place order']
+                          'add', 'submit', 'continue', 'proceed', 'confirm', 'place order',
+                          'cart', 'view cart', 'go to cart']
         menu_keywords = ['menu', 'navigation', 'nav', 'hamburger', 'close', 'open menu']
         nav_keywords = ['home', 'about', 'contact', 'account', 'login', 'sign in', 'cart', 
                        'wishlist', 'search', 'help', 'faq', 'support', 'shipping', 'returns']
         product_keywords = ['product', 'item', '$', 'price', 'shop', 'quick view', 'quick add',
-                           'trouser', 'pant', 'skirt', 'dress', 'shirt', 'shoe', 'jacket']
+                           'trouser', 'pant', 'skirt', 'dress', 'shirt', 'shoe', 'jacket',
+                           'earring', 'ring', 'necklace', 'bracelet', 'jewelry', 'jewellery']
         
         for i, feature_emb in enumerate(feature_embeddings):
             similarity = np.dot(goal_embedding, feature_emb) / (
@@ -155,19 +174,24 @@ async def semantic_filter_features(
             feature = features[i]
             text_lower = (feature.get('text', '') + ' ' + feature.get('aria_label', '') + ' ' + feature.get('href', '')).lower()
             
-            # Strong penalty for pagination to avoid loops
+            # VERY STRONG penalty for pagination to stop loops completely
             is_pagination = any(kw in text_lower for kw in pagination_keywords)
             if is_pagination and feature.get('type') == 'link':
-                similarity *= 0.1  # Very strong penalty
+                similarity *= 0.01  # Nearly eliminate pagination links from results
             
-            # Context-aware navigation/menu filtering
+            # Penalty for already clicked elements to avoid loops
+            is_clicked = feature.get('already_clicked', False)
+            if is_clicked:
+                similarity *= 0.3  # Strong penalty for previously clicked elements
+            
+            # Context-aware navigation/menu filtering - APPLY BEFORE EXACT MATCH
             is_nav = any(kw in text_lower for kw in nav_keywords)
             is_menu = any(kw in text_lower for kw in menu_keywords)
             
             # If this is a product-focused goal, heavily penalize nav/menu items
             if is_product_focused:
-                if is_nav and feature.get('type') == 'link':
-                    similarity *= 0.15  # Strong penalty for nav links
+                if is_nav and feature.get('type') in ['link', 'button']:
+                    similarity *= 0.05  # Very strong penalty for nav (including "home")
                 if is_menu and feature.get('type') in ['button', 'link']:
                     similarity *= 0.05  # Very strong penalty for menu
                     
@@ -175,16 +199,27 @@ async def semantic_filter_features(
                 link_text = feature.get('text', '').strip()
                 if feature.get('type') == 'link' and len(link_text) < 4 and not any(kw in text_lower for kw in product_keywords):
                     similarity *= 0.2  # Short nav text penalty
+            
+            # EXACT WORD MATCH BOOST - Prefer exact matches (comes AFTER nav penalty)
+            # Example: "ring" should match "Rings (16)" NOT "Earrings (62)"
+            import re
+            for key_term in goal_key_terms:
+                # Use word boundaries to match whole words only
+                pattern = r'\b' + re.escape(key_term) + r'\b'
+                if re.search(pattern, text_lower):
+                    similarity *= 5.0  # MASSIVE boost for exact word match
+                    logger.info(f"✨ Exact match boost: '{key_term}' in '{text_lower[:50]}'")
+                    break  # Only boost once per feature
             else:
                 # Not product-focused, so category navigation is useful
                 is_category = any(kw in text_lower for kw in category_keywords)
                 if is_category and feature.get('type') == 'link' and not is_pagination:
-                    similarity *= 1.5  # Boost category navigation
+                    similarity *= 2.0  # Strong boost for category navigation (jewelry, women, etc)
             
             # VERY STRONG boost for product links (actual items for sale)
             is_product = any(kw in text_lower for kw in product_keywords)
             if is_product and feature.get('type') == 'link' and not is_pagination:
-                similarity *= 3.5  # Massive boost for product links
+                similarity *= 4.0  # Massive boost for product links (higher than before)
             
             # STRONG boost for action buttons (add to cart, buy now, etc.)
             is_action = any(kw in text_lower for kw in action_keywords)
