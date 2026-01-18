@@ -1,4 +1,4 @@
-#!/Users/notjackl3/Desktop/CODING/uoft-hacks/uoft-hacks/backend/venv/bin/python3.12
+#!/Users/notjackl3/Desktop/CODING/uoft-hacks/uoft-hacks/backend/venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys
